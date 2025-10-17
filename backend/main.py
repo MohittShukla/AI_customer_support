@@ -9,7 +9,8 @@ import os
 import logging
 from uuid import uuid4
 from dotenv import load_dotenv
-from google import genai
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold # <-- FIX: Import necessary types
 from apscheduler.schedulers.background import BackgroundScheduler
 from collections import defaultdict
 import time
@@ -28,8 +29,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in environment variables! Put it in .env")
 
-# Create client using the new google-genai SDK
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
 # ------------------ FastAPI setup ------------------
 app = FastAPI(title="Customer Support Bot API")
@@ -40,7 +41,7 @@ MAX_REQUESTS = 30
 request_counts: Dict[str, List[float]] = defaultdict(list)
 
 # Session timeout
-SESSION_TIMEOUT = 3600
+SESSION_TIMEOUT = 3600 # 1 hour
 
 # CORS
 app.add_middleware(
@@ -64,6 +65,7 @@ class Session(BaseModel):
     messages: List[Message] = []
     escalated: bool = False
     escalation_reason: Optional[str] = None
+    last_activity: str # To track session activity for timeout
 
 class QueryRequest(BaseModel):
     session_id: str
@@ -110,7 +112,7 @@ def cleanup_expired_sessions():
     now = datetime.now()
     expired = [
         sid for sid, s in sessions_db.items()
-        if (now - datetime.fromisoformat(s.created_at)).total_seconds() > SESSION_TIMEOUT
+        if (now - datetime.fromisoformat(s.last_activity)).total_seconds() > SESSION_TIMEOUT
     ]
     for sid in expired:
         logger.info(f"Cleaning up expired session {sid}")
@@ -130,7 +132,7 @@ def create_faq_context() -> str:
         ctx += "\n"
     return ctx
 
-def get_system_prompt() -> str:
+def get_system_prompt_content() -> str:
     faq_context = create_faq_context()
     return (
         "You are a professional, empathetic customer support assistant for an e-commerce company.\n\n"
@@ -148,74 +150,87 @@ def get_system_prompt() -> str:
         "- Billing disputes\n"
         "- Customer frustration or anger\n"
         "- Issues not covered in FAQs after 2 attempts\n"
+        "Strictly adhere to these instructions. Start by greeting the user politely."
     )
-
-def build_prompt_from_history(messages: List[Message]) -> str:
-    """
-    Build a single prompt string containing the system instruction
-    and the recent conversation history. We include messages up to
-    a safe token budget (simple approach: include last 10 messages).
-    """
-    system = get_system_prompt()
-    history = []
-    for msg in messages[-10:]:
-        role = "Assistant" if msg.role == "assistant" else "User"
-        history.append(f"{role}: {msg.content}")
-    # The model will respond as "Assistant:" after the user's latest message.
-    prompt = system + "\n\nConversation:\n" + "\n".join(history) + "\nAssistant:"
-    return prompt
 
 def call_gemini_api(messages: List[Message], session_id: str) -> str:
     """
-    Use google-genai's client.models.generate_content with correct arguments.
+    Calls the Gemini API with the correct model name, chat history,
+    and safety settings to prevent unnecessary blocking.
     """
-    if not messages:
-        return "Hello! How can I help you today?"
+    # Use a valid model from your available list
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
+    gemini_history = []
+    gemini_history.append({"role": "user", "parts": [get_system_prompt_content()]})
+    # The first 'model' turn is an acknowledgement to set the context
+    gemini_history.append({"role": "model", "parts": ["Understood. I am ready to assist customers."]})
+
+    for msg in messages[:-1]:
+        role = "user" if msg.role == "user" else "model"
+        gemini_history.append({"role": role, "parts": [msg.content]})
+
+    chat = model.start_chat(history=gemini_history)
+    latest_user_message = messages[-1].content
+    
     try:
-        prompt = build_prompt_from_history(messages)
-
-        # ✅ 1. Group generation settings into a dictionary
-        generation_config = {
-            "temperature": 0.7,
-            "max_output_tokens": 300,
-            "top_p": 0.8,
-        }
-
-        # ✅ 2. Pass the dictionary using the 'generation_config' argument
-        # ✅ 3. Use the correct, stable model name 'gemini-1.5-flash'
-        response = client.models.generate_content(
-            model="gemini-1.5-flash", 
-            contents=prompt,
-            generation_config=generation_config
+        response = chat.send_message(
+            latest_user_message,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=300,
+                top_p=0.8,
+            ),
+            # --- FIX: ADDED SAFETY SETTINGS TO PREVENT BLOCKING ON HARMLESS PROMPTS ---
+            safety_settings={
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            }
         )
         
-        text = getattr(response, "text", None)
+        # --- FIX: ADDED ROBUST HANDLING FOR BLOCKED RESPONSES ---
+        text = None
+        try:
+            text = response.text
+        except ValueError:
+            # This occurs when the response is blocked by safety filters despite the settings.
+            logger.warning(f"Response blocked by safety filters for session {session_id}.")
+            logger.warning(f"Prompt Feedback: {response.prompt_feedback}")
+            return "I'm sorry, I cannot respond to that due to safety guidelines. Could you please rephrase?"
+
         if not text:
-            logger.warning(f"Empty response for session {session_id}")
+            logger.warning(f"Empty response generated for session {session_id}")
             return "I apologize, I couldn't generate a response. Could you rephrase?"
         
-        logger.info(f"Generated response for session {session_id}")
+        logger.info(f"✅ Generated response for session {session_id}")
         return text
         
     except Exception as e:
-        logger.error(f"Error calling Gemini API for session {session_id}: {e}", exc_info=True)
+        logger.error(f"❌ Error in Gemini API call for session {session_id}: {e}", exc_info=True)
         return "I apologize, but I'm having trouble processing your request right now. A human agent will assist you shortly."
 
 def check_escalation_needed(message: str, session: Session) -> bool:
     escalation_keywords = [
         "frustrated", "angry", "complaint", "manager", "supervisor",
         "urgent", "emergency", "security", "hacked", "billing error",
-        "refund not received", "damaged product", "wrong item"
+        "refund not received", "damaged product", "wrong item", "escalate"
     ]
     message_lower = message.lower()
     if any(k in message_lower for k in escalation_keywords):
+        logger.info(f"Escalation triggered by keyword for session {session.session_id}")
         return True
+    
     if len(session.messages) >= 3:
-        recent = session.messages[-3:]
-        times = [datetime.fromisoformat(m.timestamp) for m in recent]
-        if (times[-1] - times[0]).total_seconds() < 30:
-            return True
+        user_messages_timestamps = [
+            datetime.fromisoformat(msg.timestamp) for msg in session.messages if msg.role == "user"
+        ]
+        if len(user_messages_timestamps) >= 3:
+            last_three_user_times = user_messages_timestamps[-3:]
+            if (last_three_user_times[-1] - last_three_user_times[0]).total_seconds() < 45:
+                logger.info(f"Escalation triggered by rapid consecutive messages for session {session.session_id}")
+                return True
     return False
 
 # ------------------ Middleware & error handler ------------------
@@ -223,9 +238,13 @@ def check_escalation_needed(message: str, session: Session) -> bool:
 async def rate_limit_middleware(request: Request, call_next):
     client_ip = request.client.host
     now = time.time()
+    
     request_counts[client_ip] = [t for t in request_counts[client_ip] if now - t < RATE_LIMIT_DURATION]
+    
     if len(request_counts[client_ip]) >= MAX_REQUESTS:
-        return JSONResponse(status_code=429, content={"error": "Too many requests", "message": "Please wait before making more requests"})
+        logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+        return JSONResponse(status_code=429, content={"error": "Too many requests", "message": f"Please wait {RATE_LIMIT_DURATION} seconds before making more requests"})
+    
     request_counts[client_ip].append(now)
     response = await call_next(request)
     return response
@@ -238,7 +257,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 # ------------------ Endpoints ------------------
 @app.get("/")
 def read_root():
-    return {"message": "Customer Support Bot API", "version": "1.0"}
+    return {"message": "Customer Support Bot API", "version": "1.1"}
 
 @app.get("/health")
 def health_check():
@@ -247,17 +266,40 @@ def health_check():
 @app.post("/chat/new-session")
 def new_session(customer_name: Optional[str] = None):
     session_id = str(uuid4())
-    session = Session(session_id=session_id, customer_name=customer_name, created_at=datetime.now().isoformat(), messages=[])
+    now_iso = datetime.now().isoformat()
+    session = Session(session_id=session_id, customer_name=customer_name, created_at=now_iso, last_activity=now_iso, messages=[])
     sessions_db[session_id] = session
-    return {"session_id": session_id, "message": "Session created"}
+    logger.info(f"New session created: {session_id} for {customer_name}")
+    
+    initial_bot_message = "Hello! How can I help you today?"
+    session.messages.append(Message(role="assistant", content=initial_bot_message, timestamp=now_iso))
+    
+    return {"session_id": session_id, "message": initial_bot_message}
 
 @app.post("/chat/query")
 def process_query(request: QueryRequest):
+    now_iso = datetime.now().isoformat()
+    
     if request.session_id not in sessions_db:
-        sessions_db[request.session_id] = Session(session_id=request.session_id, customer_name=request.customer_name, created_at=datetime.now().isoformat(), messages=[])
+        logger.warning(f"Session {request.session_id} not found. Creating new one.")
+        sessions_db[request.session_id] = Session(
+            session_id=request.session_id, 
+            customer_name=request.customer_name, 
+            created_at=now_iso, 
+            last_activity=now_iso,
+            messages=[]
+        )
+        sessions_db[request.session_id].messages.append(Message(role="assistant", content="Hello! How can I help you today?", timestamp=now_iso))
+
     session = sessions_db[request.session_id]
+    session.last_activity = now_iso
+
+    if request.customer_name and not session.customer_name:
+        session.customer_name = request.customer_name
+        logger.info(f"Updated customer name for session {session.session_id} to {session.customer_name}")
 
     if session.escalated:
+        logger.info(f"Query for escalated session {request.session_id}. Returning escalation message.")
         return {
             "session_id": request.session_id,
             "escalated": True,
@@ -265,13 +307,14 @@ def process_query(request: QueryRequest):
             "escalation_reason": session.escalation_reason
         }
 
-    # Append user message
-    session.messages.append(Message(role="user", content=request.message, timestamp=datetime.now().isoformat()))
+    user_message_obj = Message(role="user", content=request.message, timestamp=now_iso)
+    session.messages.append(user_message_obj)
+    logger.info(f"User message added to session {request.session_id}: {request.message}")
 
-    # Escalation check
     if check_escalation_needed(request.message, session):
         session.escalated = True
         session.escalation_reason = "Complex issue or user frustration detected."
+        logger.warning(f"Session {request.session_id} escalated due to: {session.escalation_reason}")
         return {
             "session_id": request.session_id,
             "escalated": True,
@@ -279,25 +322,31 @@ def process_query(request: QueryRequest):
             "escalation_reason": session.escalation_reason
         }
 
-    # Call Gemini
     ai_response = call_gemini_api(session.messages, request.session_id)
-    session.messages.append(Message(role="assistant", content=ai_response, timestamp=datetime.now().isoformat()))
+    session.messages.append(Message(role="assistant", content=ai_response, timestamp=now_iso))
+    logger.info(f"AI response for session {request.session_id}: {ai_response}")
 
     return {"session_id": request.session_id, "response": ai_response, "escalated": False, "message_count": len(session.messages)}
 
 @app.get("/chat/session/{session_id}")
 def get_session(session_id: str):
     if session_id not in sessions_db:
+        logger.warning(f"Attempted to retrieve non-existent session: {session_id}")
         raise HTTPException(status_code=404, detail="Session not found")
+    
+    sessions_db[session_id].last_activity = datetime.now().isoformat()
     return sessions_db[session_id]
 
 @app.post("/chat/escalate")
 def escalate_issue(request: EscalationRequest):
     if request.session_id not in sessions_db:
+        logger.warning(f"Attempted to escalate non-existent session: {request.session_id}")
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions_db[request.session_id]
     session.escalated = True
     session.escalation_reason = request.reason
+    session.last_activity = datetime.now().isoformat()
+    logger.warning(f"Session {request.session_id} manually escalated with reason: {request.reason}")
     return {"session_id": request.session_id, "status": "escalated", "message": "Your issue has been escalated to support."}
 
 @app.get("/faqs")
